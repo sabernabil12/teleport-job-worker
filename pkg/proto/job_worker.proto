@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package jobworker;
+
+option go_package = "teleport/pkg/proto";
+
+service JobWorker {
+  rpc StartJob(StartJobRequest) returns (StartJobResponse);
+  rpc StopJob(StopJobRequest) returns (StopJobResponse);
+  rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
+  rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputResponse);
+}
+
+message StartJobRequest {
+  string command = 1;
+  repeated string args = 2;
+  map<string, string> env = 3;
+}
+
+message StartJobResponse {
+  string job_id = 1;
+  string status = 2;
+  string start_time = 3;
+}
+
+message StopJobRequest {
+  string job_id = 1;
+}
+
+message StopJobResponse {
+  bool success = 1;
+  string end_time = 2;
+}
+
+message GetJobStatusRequest {
+  string job_id = 1;
+}
+
+message GetJobStatusResponse {
+  string status = 1;
+  int32 exit_code = 2;
+  string start_time = 3;
+  string end_time = 4;
+}
+
+message StreamJobOutputRequest {
+  string job_id = 1;
+}
+
+message StreamJobOutputResponse {
+  bytes data = 1;
+  string timestamp = 2;
+} 
