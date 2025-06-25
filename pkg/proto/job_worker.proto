@@ -4,6 +4,16 @@ package jobworker;
 
 option go_package = "teleport/pkg/proto";
 
+// JobStatus represents the current state of a job
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;  // Default value, should not be used
+  JOB_STATUS_CREATED = 1;      // Job created but not started
+  JOB_STATUS_RUNNING = 2;      // Job is currently executing
+  JOB_STATUS_COMPLETED = 3;    // Job finished successfully
+  JOB_STATUS_ERROR = 4;        // Job failed or encountered an error
+  JOB_STATUS_STOPPED = 5;      // Job was manually stopped
+}
+
 service JobWorker {
   rpc StartJob(StartJobRequest) returns (StartJobResponse);
   rpc StopJob(StopJobRequest) returns (StopJobResponse);
@@ -14,12 +24,11 @@ service JobWorker {
 message StartJobRequest {
   string command = 1;
   repeated string args = 2;
-  map<string, string> env = 3;
 }
 
 message StartJobResponse {
   string job_id = 1;
-  string status = 2;
+  JobStatus status = 2;
   string start_time = 3;
 }
 
@@ -37,7 +46,7 @@ message GetJobStatusRequest {
 }
 
 message GetJobStatusResponse {
-  string status = 1;
+  JobStatus status = 1;
   int32 exit_code = 2;
   string start_time = 3;
   string end_time = 4;

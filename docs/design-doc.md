@@ -1,9 +1,9 @@
 # Job Worker Service: Design Document
 
-## Table of Contents
+## Table of Contents 
 
 - [Job Worker Service: Design Document](#job-worker-service-design-document)
-  - [Table of Contents](#table-of-contents)
+  - [Table of Contents 1](#table-of-contents-1)
   - [Overview](#overview)
   - [Scope](#scope)
   - [CLI User Experience](#cli-user-experience)
@@ -16,6 +16,7 @@
     - [Example Commands](#example-commands)
   - [Proposed API](#proposed-api)
     - [gRPC Service Definition](#grpc-service-definition)
+    - [Job Status Enum](#job-status-enum)
       - [Messages](#messages)
   - [Design Approach](#design-approach)
   - [Graceful Shutdown](#graceful-shutdown)
@@ -23,6 +24,7 @@
     - [Job Cleanup](#job-cleanup)
     - [Timeout Management](#timeout-management)
     - [Implementation Details](#implementation-details)
+    - [**Stream Termination**:](#stream-termination)
   - [Implementation Details](#implementation-details-1)
     - [Worker Library](#worker-library)
     - [API Server](#api-server)
@@ -33,10 +35,17 @@
     - [**Key Benefits**](#key-benefits)
     - [**Why Not Other Approaches**](#why-not-other-approaches)
     - [**Why this approach is efficient**](#why-this-approach-is-efficient)
+  - [Job Stopping \& Termination](#job-stopping--termination)
+    - [**Job Stop Methods**](#job-stop-methods)
+    - [**StopJob Implementation**](#stopjob-implementation)
+    - [**Process Cleanup**](#process-cleanup)
+    - [**Error Handling**](#error-handling)
+    - [**Implementation Details**](#implementation-details-3)
   - [gRPC Streaming Lifecycle Management](#grpc-streaming-lifecycle-management)
     - [**Stream Lifecycle**](#stream-lifecycle)
     - [**Client Disconnection Handling**](#client-disconnection-handling)
     - [**Stream Patterns**](#stream-patterns)
+    - [**Graceful Shutdown Handling**](#graceful-shutdown-handling)
   - [Security Considerations](#security-considerations)
     - [Security Implementation Details](#security-implementation-details)
   - [Edge Cases \& Error Handling](#edge-cases--error-handling)
@@ -95,9 +104,9 @@ The CLI uses a simplified syntax:
 
 #### **Security & Authentication**
 - **mTLS Communication**: TLS 1.3 with client certificate verification.
-- **Strong Cipher Suite**: Explicitly configured `TLS_AES_256_GCM_SHA384` for maximum security.
-- **File-based Authorization**: Client certificate subjects validated against allowlist.
-- **Input Validation**: Comprehensive command and argument sanitization.
+- **Hardcoded Authentication**: Client certificate subjects validated against hardcoded allowlist.
+- **Command-based Authorization**: Users are restricted to specific allowed commands based on their identity.
+- **Input Validation**: All user input (commands, arguments) is validated and sanitized. EG: check for forbidden characters, length check etc.
 - **Process Isolation**: Jobs run as isolated child processes without shell interpretation.
 
 #### **Performance & Reliability**
@@ -105,7 +114,7 @@ The CLI uses a simplified syntax:
 - **Concurrent Job Support**: Multiple jobs and clients handled simultaneously.
 - **UUID-based Job IDs**: Prevents race conditions and ensures uniqueness.
 - **Graceful Shutdown**: Signal handling with job cleanup and 30-second timeout.
-- **Memory-efficient Buffering**: 100-item buffer per job prevents unbounded memory growth.
+- **Unbounded Output Buffering**: Ensures full output capture without data loss.
 
 #### **User Experience**
 - **Simple CLI Interface**: Intuitive commands without complex flags.
@@ -115,7 +124,6 @@ The CLI uses a simplified syntax:
 
 #### **Architecture & Design**
 - **Direct Pipe with Multiplexing**: Efficient output streaming architecture.
-- **Zero-copy Data Flow**: Direct from process pipes to network streams.
 - **Automatic Cleanup**: Proper process reaping and resource management.
 - **Extensible Design**: Clean separation between worker, server, and client components.
 
@@ -151,17 +159,29 @@ service JobWorker {
 }
 ```
 
+### Job Status Enum
+
+```protobuf
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;  // Default value, should not be used
+  JOB_STATUS_CREATED = 1;      // Job created but not started
+  JOB_STATUS_RUNNING = 2;      // Job is currently executing
+  JOB_STATUS_COMPLETED = 3;    // Job finished successfully
+  JOB_STATUS_ERROR = 4;        // Job failed or encountered an error
+  JOB_STATUS_STOPPED = 5;      // Job was manually stopped
+}
+```
+
 #### Messages
 
-- `StartJobRequest`: Command (string), arguments ([]string), environment (map[string]string) - TODO: Environment variable support not yet implemented in server.
-- `StartJobResponse`: Job ID (string), initial status (string), start time (string).
+- `StartJobRequest`: Command (string), arguments ([]string).
+- `StartJobResponse`: Job ID (string), status (JobStatus), start time (string).
 - `StopJobRequest`: Job ID (string).
 - `StopJobResponse`: Success/failure (bool), end time (string).
 - `GetJobStatusRequest`: Job ID (string).
-- `GetJobStatusResponse`: Status (running, completed, error, stopped), exit code (int32), start time (string), end time (string).
+- `GetJobStatusResponse`: Status (JobStatus), exit code (int32), start time (string), end time (string).
 - `StreamJobOutputRequest`: Job ID (string).
 - `StreamJobOutputResponse`: Data (bytes), timestamp (string).
-
 
 ---
 
@@ -179,27 +199,35 @@ service JobWorker {
 The server implements graceful shutdown to ensure data integrity and proper resource cleanup:
 
 ### Shutdown Sequence
+
 1. **Stop accepting new connections** - gRPC server stops accepting new requests.
 2. **Wait for active requests** - Allows ongoing gRPC calls to complete (30-second timeout).
 3. **Job cleanup** - Stops all running jobs gracefully.
 4. **Resource cleanup** - Closes connections and releases resources.
 
 ### Job Cleanup
+
 - Iterates through all active jobs.
 - Stops running jobs using process termination.
 - Logs cleanup progress and any errors.
 - Ensures no orphaned processes remain.
 
 ### Timeout Management
+
 - 30-second timeout for graceful shutdown.
 - Falls back to forced shutdown if timeout exceeded.
 - Prevents indefinite hanging during shutdown.
 
 ### Implementation Details
+
 - Uses Go's `signal.Notify()` for signal handling.
 - Leverages gRPC's `GracefulStop()` for connection management.
 - Thread-safe job cleanup with mutex protection.
 - Comprehensive logging for debugging and monitoring.
+
+### **Stream Termination**: 
+
+Streams end when job completes, client disconnects, server shuts down, or error occurs. Client channels are automatically removed from broadcast list and closed.
 
 ---
 
@@ -210,14 +238,19 @@ The server implements graceful shutdown to ensure data integrity and proper reso
 - **Job Management**: Maintains a map of job UUIDs to process handles and metadata. Uses atomic UUID generation to avoid race conditions in concurrent job creation.
 - **Process Management**: Each job creates a child process using `exec.Command()`.
 - **Process Reaping**: For every job, a dedicated goroutine calls `Cmd.Wait()` as soon as the process exits, ensuring all child processes are properly reaped and no zombies remain.
-- **Output Streaming**: Implements Direct Pipe with Multiplexing architecture (see [Output Streaming Architecture](#output-streaming-architecture) for detailed technical implementation). Uses `os.Pipe` to capture stdout and stderr from child processes. Both stdout and stderr are combined into a single output channel that streams raw bytes without assumptions about content type (text/binary). Output is buffered in channels (100-item buffer per job) and can be streamed to multiple clients from the start. Output is captured using goroutines that read from process pipes and write to channels, enabling real-time streaming without polling or busy-waiting. The capture starts immediately when the process begins, ensuring no output is lost.
+- **Output Streaming**: Implements Direct Pipe with Broadcast architecture (see [Output Streaming Architecture](#output-streaming-architecture) for detailed technical implementation). Uses `os.Pipe` to capture stdout and stderr from child processes. Both stdout and stderr are combined into a single broadcast stream that sends raw bytes to all connected clients without assumptions about content type (text/binary). Each client gets their own dedicated channel, ensuring no data stealing between clients. Output is captured using two goroutines that read from process pipes (stdout and stderr) and broadcast to all client channels, enabling real-time streaming without polling or busy-waiting. The capture starts immediately when the process begins, ensuring no output is lost.
 - **Concurrency**: Uses goroutines and channels for process management and output streaming.
 
 ### API Server
 
 - **gRPC**: Exposes job management APIs.
 - **TLS**: Configured with strong cipher suites, client cert verification, and secure key storage.
-- **Authorization**: Implements a simple authorization scheme by checking the client certificate subject against an allowlist before allowing access to any API. Only clients whose certificate subject matches an entry in the allowlist are permitted to use the API.
+- **Hardcoded Authentication**: Client certificate subjects are validated against hardcoded allowlist before allowing access to any API.
+- **Command-based Authorization**: Users are restricted to specific allowed commands based on their identity. Authorization logic is separated into `auth.go` for better code organization. Multiple user profiles are supported:
+  - **Admin Profile** (`CN=admin`): Full system access including `ps`, `top`, `df`, `du`, `who`, `w`.
+  - **Developer Profile** (`CN=developer`): Development tools access including `git`, `go`, `make`.
+  - **Read-only Profile** (`CN=readonly`): Limited to basic read operations like `echo`, `ls`, `cat`, `head`, `tail`.
+  - **Default Profile**: Safe commands for users not explicitly configured.
 
 ### CLI
 
@@ -229,52 +262,54 @@ The server implements graceful shutdown to ensure data integrity and proper reso
 
 ## Output Streaming Architecture
 
-The system implements **Direct Pipe with Multiplexing** for efficient real-time output streaming. Here's the concrete architecture:
+The system implements **Direct Pipe with Broadcast** for efficient real-time output streaming. Here's the concrete architecture:
 
 ### **Implementation Details**
 
 1. **Process Output Capture**:
    - Each job creates child process using `exec.Command()`.
    - `StdoutPipe()` and `StderrPipe()` create OS-level pipes connected to the child process.
-   - Two goroutines run `io.Copy(&channelWriter{job.Output}, pipe)` for stdout and stderr.
-   - Both stdout and stderr are combined into a single output channel.
-   - Raw bytes are immediately written to a buffered channel (100-item capacity per job).
+   - Two separate goroutines run `io.Copy(&broadcastWriter{job}, pipe)` for stdout and stderr.
+   - Both stdout and stderr are combined into a single broadcast stream.
+   - Raw bytes are immediately broadcast to all connected clients.
 
-2. **Channel-Based Multiplexing**:
-   - Each job has a dedicated `chan []byte` with 100-item buffer.
-   - `channelWriter` implements `io.Writer` interface to bridge pipes to channels.
-   - Multiple gRPC clients can read from the same channel concurrently.
-   - Channel is closed when process terminates to signal end-of-stream.
+2. **Broadcast-Based Multiplexing**:
+   - Each job maintains a map of client channels (`map[chan []byte]bool`).
+   - `broadcastWriter` implements `io.Writer` interface to broadcast to all clients.
+   - Each client gets their own dedicated unbuffered channel.
+   - Data is copied for each client to prevent interference between clients.
+   - Slow clients are skipped (non-blocking send) to avoid blocking the broadcast.
 
 3. **gRPC Streaming Layer**:
    - Server maintains a map of job UUIDs to worker.Job instances.
-   - `StreamJobOutput` RPC creates a goroutine that monitors job status.
-   - Main loop uses `select` to handle: output data, context cancellation, or job completion.
-   - Each client gets a dedicated gRPC stream that reads from the shared job output channel.
+   - `StreamJobOutput` RPC creates a dedicated client channel and adds it to the job's broadcast list.
+   - Each client gets an independent gRPC stream that reads from their dedicated channel.
+   - Client channels are automatically cleaned up when clients disconnect or job completes.
 
 ### **Data Flow**
 ```
 Child Process (stdout + stderr) 
     ↓ (OS pipes)
-io.Copy() goroutines (2x)
-    ↓ (channelWriter)
-Single Buffered Channel (100 items)
-    ↓ (multiple readers)
-gRPC Stream Clients
+io.Copy() goroutines (2x - stdout + stderr)
+    ↓ (broadcastWriter)
+Broadcast to All Client Channels
+    ↓ (one channel per client)
+gRPC Stream Clients (independent)
 ```
 
 ### **Key Benefits**
-- **Zero-copy**: Data flows directly from process pipes to network streams.
 - **Real-time**: Output appears immediately as process produces it.
-- **Concurrent**: Multiple clients can stream the same job output.
-- **Memory efficient**: 100-item buffer prevents unbounded memory growth.
-- **Automatic cleanup**: Channel closure signals end-of-stream to all clients.
+- **Concurrent**: Multiple clients can stream the same job output without data stealing.
+- **Full output capture**: Each client receives all output from the start.
+- **Automatic cleanup**: Client channels are closed when clients disconnect or job completes.
 - **Simplified**: Single output stream eliminates complexity of separate stdout/stderr handling.
+- **No interference**: Each client gets their own data copy, preventing data stealing between clients.
 
 ### **Why Not Other Approaches**
 - **File + fsnotify**: Would require disk I/O and file management overhead.
 - **Ring buffer**: More complex, doesn't provide the same real-time guarantees.
 - **Separate stdout/stderr channels**: Added complexity without significant benefit for most use cases.
+- **Shared single channel**: Multiple clients reading from same channel would steal data from each other.
 
 ### **Why this approach is efficient**
 - **Uses blocking I/O:** Goroutines read from OS pipes and sleep until new output is available, consuming no CPU while idle.
@@ -284,31 +319,99 @@ gRPC Stream Clients
 
 ---
 
+## Job Stopping & Termination
+
+The system provides comprehensive job stopping capabilities with proper process management and cleanup:
+
+### **Job Stop Methods**
+
+1. **Client-Initiated Stop**: Clients can explicitly stop running jobs using the `StopJob` RPC.
+2. **Server Shutdown**: All running jobs are stopped during graceful shutdown.
+3. **Process Completion**: Jobs naturally terminate when their process completes.
+
+### **StopJob Implementation**
+
+**Process Termination**:
+- Uses `Process.Kill()` to send SIGKILL to the job's process.
+- Ensures immediate termination of the child process.
+- Updates job status to `JOB_STATUS_STOPPED` and records end time.
+- Closes the output channel to signal end-of-stream to all clients.
+
+**Response**:
+- Returns success/failure status.
+- Includes end time when the job was stopped.
+- Provides clear error messages if job doesn't exist or isn't running.
+
+### **Process Cleanup**
+
+**Automatic Reaping**:
+- Each job has a dedicated goroutine running `Cmd.Wait()` to reap the process.
+- Ensures no zombie processes remain in the system.
+- Handles both natural completion and forced termination.
+
+**Resource Cleanup**:
+- Output channels are properly closed using `sync.Once` to prevent double-closing.
+- Process pipes are automatically cleaned up by Go's exec package.
+- Memory resources are released when job is removed from tracking.
+
+### **Error Handling**
+
+**Common Scenarios**:
+- **Job Not Found**: Returns error if job ID doesn't exist.
+- **Job Already Stopped**: Returns error if job is not in `JOB_STATUS_RUNNING` status.
+- **Process Kill Failure**: Returns error if OS-level process termination fails.
+- **Network Errors**: Handles client disconnection during stop operation.
+
+**Graceful Degradation**:
+- If stop operation fails, job remains in `JOB_STATUS_RUNNING` status.
+- Server continues to track the job until it naturally completes.
+- No partial state corruption occurs.
+
+### **Implementation Details**
+
+**Thread Safety**:
+- Job stopping is protected by mutex to prevent race conditions.
+- Status updates are atomic and consistent.
+- Multiple clients can attempt to stop the same job safely.
+
+**Signal Handling**:
+- Uses SIGKILL for immediate termination (no graceful shutdown for individual jobs).
+- Process group is handled automatically by Go's exec package.
+- No custom signal handling needed for job termination.
+
+---
 ## gRPC Streaming Lifecycle Management
 
 ### **Stream Lifecycle**
 
-**Stream Creation**: Client initiates `StreamJobOutput` RPC; server validates authorization and creates dedicated goroutine for stream management.
+**Stream Creation**: Client initiates `StreamJobOutput` RPC; server validates authorization, creates dedicated client channel, and adds it to the job's broadcast list.
 
-**Stream Termination**: Streams end when job completes, client disconnects, server shuts down, or error occurs.
+**Stream Termination**: Streams end when job completes, client disconnects, server shuts down, or error occurs. Client channels are automatically removed from broadcast list and closed.
 
 ### **Client Disconnection Handling**
 
 **Detection**: Monitor `stream.Context().Done()` for client cancellation and detect network errors during `stream.Send()`.
 
-**Cleanup**: Stop reading from job output channel for disconnected client; continue serving other clients; log disconnection.
+**Cleanup**: Remove client channel from job's broadcast list; close client channel; continue serving other clients; log disconnection.
 
 ### **Stream Patterns**
 
-**Concurrent Streaming**: Multiple clients can stream same job output; each gets independent stream with shared job output channel.
+**Concurrent Streaming**: Multiple clients can stream same job output; each gets independent stream with dedicated client channel.
 
 **Error Handling**: Network errors terminate stream; authorization failures return error; context cancellation triggers graceful cleanup.
 
 **Implementation**:
 ```go
+// Create dedicated channel for this client
+clientChan := make(chan []byte)
+defer job.RemoveClient(clientChan)
+
+// Add to broadcast list
+job.AddClient(clientChan)
+
 for {
     select {
-    case data, ok := <-jobOutput:
+    case data, ok := <-clientChan:
         if !ok { return nil } // Job completed
         if err := stream.Send(data); err != nil { return err } // Client disconnected
     case <-ctx.Done():
@@ -317,14 +420,20 @@ for {
 }
 ```
 
+### **Graceful Shutdown Handling**
+
+**Server Shutdown**: During graceful shutdown, all jobs (running and completed) have their client channels closed via `CloseAllClients()` to ensure no goroutines are left waiting on closed channels.
+
+**Channel Cleanup**: The `CleanupJobs()` method ensures all client channels are properly closed for both running jobs (via `Stop()`) and completed jobs (via `CloseAllClients()`).
+
 ---
 
 ## Security Considerations
 
 - **mTLS**: All API communication uses mutual TLS. Only clients with valid certificates (signed by a trusted CA) can connect.
 - **TLS Configuration**: Use TLS 1.3 (or 1.2 as fallback), strong cipher suites (Go will use it's default cipher suites for TLS 1.2+), and secure certificate/key handling.
-- **Authorization**: Simple allowlist: only clients with certificate subjects in the allowlist can access the API.
-- **Input Validation**: All user input (commands, arguments, environment) is validated and sanitized. EG: check for forbidden characters, length check etc. 
+- **Authorization**: Simple hardcoded authentication: only clients with certificate subjects in the hardcoded allowlist can access the API.
+- **Input Validation**: All user input (commands, arguments) is validated and sanitized. EG: check for forbidden characters, length check etc.
 - **Process Isolation**: Each job runs as a child process of the worker. No shell interpretation; arguments are passed directly to the executable.
 - **Resource Limits**: Jobs can be placed in cgroups for resource control (CPU, memory) **(Out of scope)**.
 
@@ -342,15 +451,22 @@ for {
   - **Server Configuration**: gRPC server uses `credentials.NewServerTLSFromFile()` to load server certificate and key.
   - **Client Verification**: Server requires client certificates via `grpc.Creds(creds)` with mutual TLS enabled.
   - **Role Extraction**: Client certificate subject (Distinguished Name) is extracted using `tlsInfo.State.PeerCertificates[0].Subject.String()`.
-  - **Authorization Flow**: Certificate subject is compared against hardcoded allowlist in server code; access granted only if subject matches.
+  - **Authentication Flow**: Certificate subject is compared against hardcoded allowlist; access granted only if subject matches.
+
+- **Authentication Implementation**:
+  - **Hardcoded Allowlist**: Client certificate subjects are hardcoded in the server with the following allowed users: `CN=client`, `CN=admin`, `CN=developer`, `CN=analyst`, `CN=readonly`.
+  - **Authentication Check**: Server validates client certificate subject against the hardcoded allowlist before allowing access to any API.
+  - **Security**: Only clients whose certificate subject matches an entry in the hardcoded allowlist are permitted to use the API.
+  - **Simplicity**: No external file dependencies; all authentication rules are embedded in the server code.
 
 - **Authorization Implementation**:
-  - **File-Based Allowlist**: Client certificate subjects are loaded from `certs/allowlist.txt` at server startup.
-  - **Allowlist Format**: One certificate subject per line, comments start with #, empty lines ignored.
-  - **Current Allowlist**: `"CN=client"` - matches the client certificate generated by the certificate utility.
-  - **Authorization Check**: Server validates client certificate subject against the loaded allowlist before allowing access to any API.
-  - **Security**: Only clients whose certificate subject matches an entry in the allowlist are permitted to use the API.
-  - **Reload**: Allowlist is loaded at startup; server restart required for changes to take effect.
+  - **Multiple User Profiles**: Hardcoded authorization profiles for different user types with varying command permissions.
+  - **Admin Profile** (`CN=admin`): Full system access including `ps`, `top`, `df`, `du`, `who`, `w`.
+  - **Developer Profile** (`CN=developer`): Development tools access including `git`, `go`, `make`.
+  - **Read-only Profile** (`CN=readonly`): Limited to basic read operations like `echo`, `ls`, `cat`, `head`, `tail`.
+  - **Default Profile**: Safe commands for users not explicitly configured.
+  - **Authorization Check**: Server validates that the requested command is in the user's allowed command list before allowing job execution.
+  - **Security**: Users can only execute commands they are explicitly authorized to run, preventing unauthorized system access.
 
 - **TLS Version**:  
   The server is explicitly configured to accept only TLS 1.3 connections for the reasons below:
@@ -359,21 +475,12 @@ for {
   - **Performance**: Faster handshake (one round trip) and reduced latency (especially important for gRPC streaming).
   - **Enforcement**: Both MinVersion and MaxVersion are set to TLS 1.3 to ensure only TLS 1.3 connections are accepted.
 
-- **Cipher Suites**:
-  Explicitly configured to use `TLS_AES_256_GCM_SHA384` (over Go's defaults) as the preferred cipher suite. This choice is made because:
-  - **Maximum Security**: Ensures we get the strongest available cipher suite rather than potentially weaker defaults.
-  - **Predictable Security**: No risk of Go's defaults changing in future releases to include less secure options.
-  - **Explicit Control**: We know exactly what cryptographic algorithms are being used.
-  - **Future-Proof**: 256-bit AES with GCM mode represents the current gold standard for TLS security.
-  - **Compliance**: Meets strict security requirements for job execution systems where security is paramount.
-
-- **Certs and Allowlist Security**:
+- **Certs and Security**:
   - Certificates and private keys are stored with strict file permissions (readable only by the service user).
   - Private keys are never committed to version control.
-  - The allowlist file (`certs/allowlist.txt`) is stored with restricted permissions (readable only by the server process).
-  - The allowlist file should be protected from tampering and monitored for unauthorized changes.
-  - Certificates and allowlist entries should be rotated regularly.
-  - Access to the certs/ directory and allowlist file should be monitored and audited.
+  - Authentication rules are hardcoded in the server and should be protected from tampering.
+  - Certificates should be rotated regularly.
+  - Access to the certs/ directory should be monitored and audited.
 
 ---
 
@@ -385,7 +492,7 @@ for {
 - **Invalid Input**: All errors are reported clearly; invalid commands or unauthorized actions are rejected with descriptive messages.
 - **Process Output Type**: The system handles both text and binary output without assumptions.
 - **Network and Transport Errors**: The system gracefully handles network interruptions and TLS handshake failures.
-- **Authorization and Authentication Failures**: Failed authentication (invalid/missing certificates) and failed authorization (not on allowlist) are handled gracefully and logged.
+- **Authorization and Authentication Failures**: Failed authentication (invalid/missing certificates) and failed authorization are handled gracefully and logged.
 - **Zombie Processes**: The worker library is responsible for reaping child processes through `Cmd.Wait()` calls in goroutines, ensuring automatic cleanup when processes terminate.
 - **Process Group Management**: Child processes are managed through Go's exec package, which handles process group creation and cleanup automatically.
 - **Race Conditions**: UUID-based job identification prevents race conditions in concurrent job creation scenarios.
@@ -404,7 +511,7 @@ for {
 **PR #2: Security Infrastructure**
 - Certificate generation utility with Go standard library
 - TLS configuration with mTLS and strong cipher suites
-- Authorization allowlist implementation
+- Hardcoded authentication and authorization implementation
 - Input validation and sanitization
 
 **PR #3: Worker Library**
@@ -429,7 +536,7 @@ for {
 
 **Unit Tests**
 - **Worker Library**: Test job creation, start/stop, output capture, and cleanup.
-- **Authorization**: Test allowlist validation with valid/invalid certificates.
+- **Authorization**: Test hardcoded authentication validation with valid/invalid certificates.
 - **Input Validation**: Test command/argument sanitization and length limits.
 
 **Integration Tests**

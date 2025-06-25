@@ -51,15 +51,17 @@ go build -o build/cli cmd/cli/main.go
 
 - Secure mTLS Communication: TLS 1.3 with client certificate verification
 - Process Isolation: Jobs run as isolated child processes without shell interpretation
-- Real-time Output Streaming: Live job output via gRPC streaming
+- Real-time Output Streaming: Live job output via gRPC streaming with broadcast pattern
 - Input Validation: Comprehensive command and argument sanitization
-- Authorization: File-based allowlist for client certificate subjects
+- Hardcoded Authentication: Client certificate subjects validated against hardcoded allowlist
+- Command-based Authorization: Users restricted to specific allowed commands based on identity
 - Graceful Shutdown: Signal handling with job cleanup and timeout
 - UUID-based Job IDs: Prevents race conditions and ensures uniqueness
+- Broadcast Output: Each client gets dedicated channel, preventing data stealing between clients
 
 ## Setup
 
-1. **Generate certificates and allowlist** (required for secure communication):
+1. **Generate certificates** (required for secure communication):
    ```bash
    go run cmd/generate-certs/main.go
    ```
@@ -72,7 +74,6 @@ go build -o build/cli cmd/cli/main.go
    - CA certificate and key (`certs/ca.crt`, `certs/ca.key`)
    - Server certificate and key (`certs/server.crt`, `certs/server.key`)
    - Client certificate and key (`certs/client.crt`, `certs/client.key`)
-   - Allowlist file (`certs/allowlist.txt`) with the client certificate subject
 
 2. **Build the applications**:
    ```bash
@@ -122,8 +123,6 @@ The CLI client supports the following commands:
 ./build/cli stop 550e8400-e29b-41d4-a716-446655440000
 ```
 
-**Note**: Job IDs are now UUIDs (e.g., `550e8400-e29b-41d4-a716-446655440000`) instead of incremental IDs to avoid race conditions in concurrent environments.
-
 ## Graceful Shutdown
 
 The server implements graceful shutdown to ensure data integrity and proper resource cleanup. When shutting down, the server will:
@@ -131,7 +130,8 @@ The server implements graceful shutdown to ensure data integrity and proper reso
 1. Stop accepting new connections
 2. Allow existing requests to complete (30-second timeout)
 3. Stop all running jobs gracefully
-4. Clean up resources and exit
+4. Close all client channels to prevent goroutine leaks
+5. Clean up resources and exit
 
 ### Shutdown Methods
 
@@ -170,7 +170,7 @@ go run cmd/generate-certs/main.go
 **Permission denied errors:**
 ```bash
 # Ensure certificate files have correct permissions
-chmod 600 certs/*.key certs/allowlist.txt
+chmod 600 certs/*.key
 chmod 644 certs/*.crt
 ```
 
@@ -225,6 +225,19 @@ chmod 644 certs/*.crt
    - Try commands with forbidden characters
    - Verify they are rejected with clear error messages
 
+3. **Test authorization rules**:
+   ```bash
+   # Test default user (CN=client) - should work
+   ./build/cli start echo "Hello World"
+   ./build/cli start cat /etc/hosts
+   
+   # Test default user - should be denied
+   ./build/cli start ps aux
+   ./build/cli start top -l 1
+   
+   # Expected error: "command 'ps' not allowed for user 'CN=client'"
+   ```
+
 ## Development
 
 - The project uses gRPC for communication between client and server
@@ -238,13 +251,35 @@ chmod 644 certs/*.crt
 ## Security
 
 - **TLS 1.3**: All communication is secured with TLS 1.3 (no fallback to older versions)
-- **Strong Cipher Suite**: Uses `TLS_AES_256_GCM_SHA384` for maximum security
 - **mTLS Authentication**: Client certificates are required for all connections
-- **File-based Authorization**: Client certificate subjects are validated against `certs/allowlist.txt`
+- **Command-based Authorization**: Users are restricted to specific allowed commands based on their identity
+- **Hardcoded Authentication**: Client certificate subjects are validated against hardcoded allowlist
 - **Input Validation**: All commands and arguments are sanitized and validated
 - **Process Isolation**: Jobs run as isolated child processes without shell interpretation
 - **Certificate Management**: Certificates are generated locally and should not be shared
-- **File Permissions**: Private keys and allowlist have restricted permissions (600)
+- **File Permissions**: Private keys have restricted permissions (600)
+
+## User Profiles & Authorization
+
+The system supports multiple user profiles with different command permissions:
+
+### **Available User Profiles**
+
+- **Admin Profile** (`CN=admin`): Full system access
+  - Commands: `echo`, `ls`, `cat`, `grep`, `find`, `wc`, `head`, `tail`, `ps`, `top`, `df`, `du`, `who`, `w`
+  
+- **Developer Profile** (`CN=developer`): Development tools access
+  - Commands: `echo`, `ls`, `cat`, `grep`, `find`, `wc`, `head`, `tail`, `git`, `go`, `make`
+  
+- **Read-only Profile** (`CN=readonly`): Basic read operations
+  - Commands: `echo`, `ls`, `cat`, `head`, `tail`
+  
+- **Default Profile** (`CN=client`): Safe commands for unconfigured users
+  - Commands: `echo`, `ls`, `cat`, `grep`, `find`, `wc`, `head`, `tail`
+
+### **Testing Different Profiles**
+
+To test different authorization profiles, you would need to generate certificates with different Common Names (CN). The current certificate generation tool creates `CN=client` by default.
 
 ## Contributing
 
@@ -284,4 +319,4 @@ chmod 644 certs/*.crt
 If you modify `pkg/proto/job_worker.proto`:
 ```bash
 protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative pkg/proto/job_worker.proto
-``` 
+```
