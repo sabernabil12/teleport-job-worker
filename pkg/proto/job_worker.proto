@@ -37,8 +37,9 @@ message StopJobRequest {
 }
 
 message StopJobResponse {
-  bool success = 1;
-  string end_time = 2;
+  // End time when the job was stopped (RFC3339 format)
+  string end_time = 1;
+  // If the job could not be stopped, an error is returned via the RPC error, not in this message.
 }
 
 message GetJobStatusRequest {

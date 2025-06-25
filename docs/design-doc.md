@@ -177,7 +177,7 @@ enum JobStatus {
 - `StartJobRequest`: Command (string), arguments ([]string).
 - `StartJobResponse`: Job ID (string), status (JobStatus), start time (string).
 - `StopJobRequest`: Job ID (string).
-- `StopJobResponse`: Success/failure (bool), end time (string).
+- `StopJobResponse`: End time (string). If the job could not be stopped, an error is returned via the RPC error, not in the response message.
 - `GetJobStatusRequest`: Job ID (string).
 - `GetJobStatusResponse`: Status (JobStatus), exit code (int32), start time (string), end time (string).
 - `StreamJobOutputRequest`: Job ID (string).
@@ -237,7 +237,7 @@ Streams end when job completes, client disconnects, server shuts down, or error 
 
 - **Job Management**: Maintains a map of job UUIDs to process handles and metadata. Uses atomic UUID generation to avoid race conditions in concurrent job creation.
 - **Process Management**: Each job creates a child process using `exec.Command()`.
-- **Process Reaping**: For every job, a dedicated goroutine calls `Cmd.Wait()` as soon as the process exits, ensuring all child processes are properly reaped and no zombies remain.
+- **Process Reaping**: For every job, a dedicated goroutine calls `Cmd.Wait()` immediately after the process is started. `Cmd.Wait()` blocks until the process exits, ensuring all child processes are properly reaped and no zombies remain.
 - **Output Streaming**: Implements Direct Pipe with Broadcast architecture (see [Output Streaming Architecture](#output-streaming-architecture) for detailed technical implementation). Uses `os.Pipe` to capture stdout and stderr from child processes. Both stdout and stderr are combined into a single broadcast stream that sends raw bytes to all connected clients without assumptions about content type (text/binary). Each client gets their own dedicated channel, ensuring no data stealing between clients. Output is captured using two goroutines that read from process pipes (stdout and stderr) and broadcast to all client channels, enabling real-time streaming without polling or busy-waiting. The capture starts immediately when the process begins, ensuring no output is lost.
 - **Concurrency**: Uses goroutines and channels for process management and output streaming.
 
