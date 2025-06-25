@@ -1,6 +1,6 @@
 # Job Worker Service: Design Document
 
-## Table of Contents 
+## Table of Contents 1
 
 - [Job Worker Service: Design Document](#job-worker-service-design-document)
   - [Table of Contents 1](#table-of-contents-1)
@@ -440,6 +440,11 @@ for {
 ### Security Implementation Details
 
 - **CA Setup**: The Certificate Authority (CA) is generated for this project using Go's standard library cryptographic packages (`crypto/rsa`, `crypto/x509`, `crypto/rand`). The CA certificate, server certificate, and client certificates are created and distributed as part of the project setup. The CA certificate is stored in the `certs/` directory, and all components reference this path for trust.
+
+  **Key and Signature Details:**
+  - **Key Type:** RSA
+  - **Key Size:** 4096 bits
+  - **Signature Algorithm:** SHA-256 with RSA (SHA256-RSA)
 
   **Why Go's standard library instead of OpenSSL:**
   - **Portability**: No external dependencies required - works on any system with Go installed.
